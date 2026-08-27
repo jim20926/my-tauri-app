@@ -1,0 +1,10 @@
+[
+  {
+    "id": "middle-school-video",
+    "title": "國中影片",
+    "description": "本機測試伺服器提供的第一支影片。",
+    "filename": "國中影片.mp4",
+    "sizeBytes": 70640339,
+    "sourceUrl": "http://localhost:3001/media/%E5%9C%8B%E4%B8%AD%E5%BD%B1%E7%89%87.mp4"
+  }
+]

@@ -18,7 +18,11 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost http://localhost:3001; media-src 'self' asset: http://asset.localhost http://localhost:3001",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/*"]
+      }
     }
   },
   "bundle": {
