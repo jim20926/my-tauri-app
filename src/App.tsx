@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
@@ -29,8 +29,12 @@ type DownloadRecord = {
   sourceUrl: string;
   sizeBytes: number;
   fileName: string;
-  localPath: string;
   downloadedAt: string;
+};
+
+type PlaybackInfo = {
+  sessionId: string;
+  url: string;
 };
 
 type DownloadError = { code: string; message: string };
@@ -92,6 +96,8 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState<number | null>(0);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
+  const [playbackErrorMessage, setPlaybackErrorMessage] = useState<string | null>(null);
 
   const visibleVideos = useMemo(() => {
     if (serverStatus === "online") return catalog;
@@ -100,12 +106,6 @@ function App() {
 
   const selectedVideo = visibleVideos.find((video) => video.id === selectedId) ?? null;
   const selectedDownload = selectedVideo ? downloads[selectedVideo.id] : undefined;
-  const playbackUrl = selectedDownload
-    ? convertFileSrc(selectedDownload.localPath)
-    : selectedVideo && serverStatus === "online"
-      ? selectedVideo.sourceUrl
-      : null;
-
   useEffect(() => {
     let cancelled = false;
 
@@ -138,6 +138,42 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let activeSessionId: string | null = null;
+    setPlaybackUrl(null);
+    setPlaybackErrorMessage(null);
+
+    if (!selectedDownload) {
+      if (selectedVideo && serverStatus === "online") setPlaybackUrl(selectedVideo.sourceUrl);
+      return () => {
+        disposed = true;
+      };
+    }
+
+    void invoke<PlaybackInfo>("open_playback", { videoId: selectedDownload.videoId })
+      .then((playback) => {
+        if (disposed) {
+          void invoke("close_playback", { sessionId: playback.sessionId });
+          return;
+        }
+        activeSessionId = playback.sessionId;
+        setPlaybackUrl(playback.url);
+      })
+      .catch((error) => {
+        if (!disposed) {
+          setErrorMessage(getInvokeError(error, "無法開啟加密影片"));
+        }
+      });
+
+    return () => {
+      disposed = true;
+      if (activeSessionId) {
+        void invoke("close_playback", { sessionId: activeSessionId });
+      }
+    };
+  }, [selectedDownload?.videoId, selectedVideo?.sourceUrl, serverStatus]);
 
   async function refreshCatalog() {
     setServerStatus("checking");
@@ -311,7 +347,13 @@ function App() {
             <>
               <div className="player-frame">
                 {playbackUrl ? (
-                  <video key={playbackUrl} controls src={playbackUrl} preload="metadata">
+                  <video
+                    key={playbackUrl}
+                    controls
+                    src={playbackUrl}
+                    preload="metadata"
+                    onError={() => setPlaybackErrorMessage("播放失敗：無法讀取離線影片，請查看日志或重新下載。")}
+                  >
                     你的瀏覽器不支援影片播放。
                   </video>
                 ) : (
@@ -320,6 +362,7 @@ function App() {
                     <p>下載後即可離線播放</p>
                   </div>
                 )}
+                {playbackErrorMessage && <div className="player-error" role="alert">{playbackErrorMessage}</div>}
                 <span className="player-tape">ARCHIVE / {selectedVideo.id.toUpperCase()}</span>
               </div>
 
