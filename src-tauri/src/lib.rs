@@ -2,6 +2,7 @@ mod crypto;
 mod download;
 mod logging;
 mod playback;
+mod watch_progress;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -28,6 +29,10 @@ pub fn run() {
             download::delete_download,
             playback::open_playback,
             playback::close_playback,
+            watch_progress::list_watch_progress,
+            watch_progress::save_watch_progress,
+            watch_progress::mark_watch_progress_synced,
+            watch_progress::apply_remote_watch_progress,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

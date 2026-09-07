@@ -1,5 +1,21 @@
 [
   {
+    "id": "first-lesson",
+    "title": "第一課",
+    "description": "本機測試伺服器提供的第一課影片。",
+    "filename": "第一課.mp4",
+    "sizeBytes": 33496044,
+    "sourceUrl": "http://localhost:3001/media/%E7%AC%AC%E4%B8%80%E8%AA%B2.mp4"
+  },
+  {
+    "id": "maritime-english-cargo-loading",
+    "title": "航海英文-貨物裝載",
+    "description": "本機測試伺服器提供的航海英文貨物裝載影片。",
+    "filename": "航海英文-貨物裝載.mp4",
+    "sizeBytes": 38115420,
+    "sourceUrl": "http://localhost:3001/media/%E8%88%AA%E6%B5%B7%E8%8B%B1%E6%96%87-%E8%B2%A8%E7%89%A9%E8%A3%9D%E8%BC%89.mp4"
+  },
+  {
     "id": "middle-school-video",
     "title": "國中影片",
     "description": "本機測試伺服器提供的第一支影片。",

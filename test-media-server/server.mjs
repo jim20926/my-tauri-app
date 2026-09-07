@@ -11,6 +11,8 @@ const mimeTypes = {
   ".json": "application/json; charset=utf-8",
   ".mp4": "video/mp4",
 };
+const watchProgress = new Map();
+const maxJsonBodyBytes = 1024 * 1024;
 
 function sendJson(response, statusCode, body) {
   response.writeHead(statusCode, {
@@ -18,6 +20,89 @@ function sendJson(response, statusCode, body) {
     "Access-Control-Allow-Origin": "*",
   });
   response.end(JSON.stringify(body));
+}
+
+function readJsonBody(request) {
+  return new Promise((resolveBody, rejectBody) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+      if (Buffer.byteLength(body, "utf8") > maxJsonBodyBytes) {
+        rejectBody(new Error("Request body too large"));
+        request.destroy();
+      }
+    });
+    request.on("end", () => {
+      try {
+        resolveBody(JSON.parse(body));
+      } catch {
+        rejectBody(new Error("Invalid JSON"));
+      }
+    });
+    request.on("error", rejectBody);
+  });
+}
+
+function isValidProgressRecord(record) {
+  return Boolean(
+    record &&
+      typeof record.videoId === "string" &&
+      record.videoId.length > 0 &&
+      typeof record.positionSeconds === "number" &&
+      Number.isFinite(record.positionSeconds) &&
+      record.positionSeconds >= 0 &&
+      typeof record.durationSeconds === "number" &&
+      Number.isFinite(record.durationSeconds) &&
+      record.durationSeconds > 0 &&
+      typeof record.completed === "boolean" &&
+      typeof record.updatedAt === "string" &&
+      record.updatedAt.length > 0
+  );
+}
+
+async function handleWatchProgress(request, response) {
+  if (request.method === "GET") {
+    sendJson(response, 200, {
+      version: 1,
+      progress: Array.from(watchProgress.values()),
+    });
+    return;
+  }
+
+  try {
+    const payload = await readJsonBody(request);
+    if (!payload || payload.version !== 1 || !Array.isArray(payload.progress)) {
+      sendJson(response, 400, { error: "Invalid watch progress payload" });
+      return;
+    }
+
+    for (const record of payload.progress) {
+      if (!isValidProgressRecord(record)) {
+        sendJson(response, 400, { error: "Invalid watch progress record" });
+        return;
+      }
+      const existing = watchProgress.get(record.videoId);
+      if (!existing || record.updatedAt >= existing.updatedAt) {
+        watchProgress.set(record.videoId, {
+          videoId: record.videoId,
+          positionSeconds: Math.min(record.positionSeconds, record.durationSeconds),
+          durationSeconds: record.durationSeconds,
+          completed: record.completed,
+          updatedAt: record.updatedAt,
+          syncState: "synced",
+          lastSyncedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    sendJson(response, 200, {
+      version: 1,
+      progress: Array.from(watchProgress.values()),
+    });
+  } catch {
+    sendJson(response, 400, { error: "Invalid JSON body" });
+  }
 }
 
 function isSafeMediaName(filename) {
@@ -88,7 +173,8 @@ async function serveVideo(request, response, filename) {
 
 const server = createServer(async (request, response) => {
   response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, PUT, OPTIONS");
+  response.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (request.method === "OPTIONS") {
     response.writeHead(204);
@@ -106,6 +192,16 @@ const server = createServer(async (request, response) => {
     } catch {
       sendJson(response, 500, { error: "Catalog unavailable" });
     }
+    return;
+  }
+
+  if (requestUrl.pathname === "/health" && ["GET", "HEAD"].includes(request.method ?? "")) {
+    sendJson(response, 200, { status: "ok" });
+    return;
+  }
+
+  if (requestUrl.pathname === "/watch-progress" && ["GET", "PUT"].includes(request.method ?? "")) {
+    await handleWatchProgress(request, response);
     return;
   }
 

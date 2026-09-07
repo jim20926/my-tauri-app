@@ -1,9 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+import {
+  useWatchProgress,
+  type ProgressSaveReason,
+  type SaveWatchProgressRequest,
+  type WatchProgress,
+} from "./watchProgress";
 
 const CATALOG_URL = "http://localhost:3001/videos.json";
+const HEALTH_URL = "http://localhost:3001/health";
+const WATCH_PROGRESS_URL = "http://localhost:3001/watch-progress";
 
 type VideoDefinition = {
   id: string;
@@ -52,7 +60,11 @@ type DownloadEvent =
   | { type: "failed"; videoId: string; error: DownloadError };
 
 type DownloadMap = Record<string, DownloadRecord>;
+
+type WatchProgressSyncToken = Pick<WatchProgress, "videoId" | "updatedAt">;
+type WatchProgressMap = Record<string, WatchProgress>;
 type ServerStatus = "checking" | "online" | "offline";
+type SyncStatus = "idle" | "syncing" | "synced" | "error";
 
 function formatBytes(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
@@ -87,9 +99,17 @@ function recordToVideo(record: DownloadRecord): VideoDefinition {
   };
 }
 
+function formatPlaybackTime(seconds: number) {
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+  return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
 function App() {
   const [catalog, setCatalog] = useState<VideoDefinition[]>([]);
   const [downloads, setDownloads] = useState<DownloadMap>({});
+  const [watchProgress, setWatchProgress] = useState<WatchProgressMap>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [serverStatus, setServerStatus] = useState<ServerStatus>("checking");
   const [activeDownloadId, setActiveDownloadId] = useState<string | null>(null);
@@ -98,6 +118,30 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [playbackErrorMessage, setPlaybackErrorMessage] = useState<string | null>(null);
+  const [localDataLoading, setLocalDataLoading] = useState(true);
+  const [localDataError, setLocalDataError] = useState<string | null>(null);
+  const [remoteErrorMessage, setRemoteErrorMessage] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>("idle");
+  const [syncErrorMessage, setSyncErrorMessage] = useState<string | null>(null);
+
+  const downloadsRef = useRef<DownloadMap>({});
+  const serverStatusRef = useRef<ServerStatus>("checking");
+  const watchProgressRef = useRef<WatchProgressMap>({});
+  const progressQueueRef = useRef<Record<string, SaveWatchProgressRequest>>({});
+  const progressSaveInFlightRef = useRef(false);
+  const syncRetryTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    downloadsRef.current = downloads;
+  }, [downloads]);
+
+  useEffect(() => {
+    serverStatusRef.current = serverStatus;
+  }, [serverStatus]);
+
+  useEffect(() => {
+    watchProgressRef.current = watchProgress;
+  }, [watchProgress]);
 
   const visibleVideos = useMemo(() => {
     if (serverStatus === "online") return catalog;
@@ -106,38 +150,100 @@ function App() {
 
   const selectedVideo = visibleVideos.find((video) => video.id === selectedId) ?? null;
   const selectedDownload = selectedVideo ? downloads[selectedVideo.id] : undefined;
-  useEffect(() => {
-    let cancelled = false;
 
-    async function initialize() {
-      const downloadsPromise = invoke<DownloadRecord[]>("list_downloads").catch(() => []);
-      const catalogPromise = fetch(CATALOG_URL)
-        .then(async (response) => {
-          if (!response.ok) throw new Error(`Catalog request failed: ${response.status}`);
-          return (await response.json()) as VideoDefinition[];
-        })
-        .catch(() => null);
-      const [storedRecords, remoteCatalog] = await Promise.all([downloadsPromise, catalogPromise]);
-      if (cancelled) return;
+  const drainProgressSaves = useCallback(async () => {
+    if (progressSaveInFlightRef.current) return;
+    const [videoId, request] = Object.entries(progressQueueRef.current)[0] ?? [];
+    if (!videoId || !request) return;
 
-      const storedDownloads = Object.fromEntries(storedRecords.map((record) => [record.videoId, record]));
-      setDownloads(storedDownloads);
-      setSelectedId(Object.keys(storedDownloads)[0] ?? null);
-
-      if (remoteCatalog) {
-        setCatalog(remoteCatalog);
-        setServerStatus("online");
-        setSelectedId((current) => current ?? remoteCatalog[0]?.id ?? null);
-      } else {
-        setServerStatus("offline");
+    progressSaveInFlightRef.current = true;
+    delete progressQueueRef.current[videoId];
+    let savedSuccessfully = false;
+    try {
+      const saved = await invoke<WatchProgress>("save_watch_progress", { request });
+      setWatchProgress((current) => ({ ...current, [saved.videoId]: saved }));
+      savedSuccessfully = true;
+    } catch (error) {
+      progressQueueRef.current[videoId] = request;
+      setErrorMessage(getInvokeError(error, "觀看進度儲存失敗"));
+    } finally {
+      progressSaveInFlightRef.current = false;
+      if (savedSuccessfully && Object.keys(progressQueueRef.current).length > 0) {
+        void drainProgressSaves();
       }
     }
-
-    void initialize();
-    return () => {
-      cancelled = true;
-    };
   }, []);
+
+  const queueProgressSave = useCallback((snapshot: SaveWatchProgressRequest, _reason: ProgressSaveReason) => {
+    if (serverStatusRef.current !== "offline" || !downloadsRef.current[snapshot.videoId]) return;
+    progressQueueRef.current[snapshot.videoId] = snapshot;
+    void drainProgressSaves();
+  }, [drainProgressSaves]);
+
+  const {
+    videoProps,
+    resumePrompt,
+    continuePlayback,
+    restartPlayback,
+    flushProgress,
+    prepareForSwitch,
+  } = useWatchProgress({
+    videoId: selectedVideo?.id ?? null,
+    sourceKey: playbackUrl,
+    enabled: Boolean(selectedDownload) && serverStatus === "offline",
+    persistedProgress: selectedVideo ? watchProgress[selectedVideo.id] ?? null : null,
+    onSnapshot: queueProgressSave,
+  });
+
+  const loadLocalData = useCallback(async () => {
+    setLocalDataLoading(true);
+    setLocalDataError(null);
+    setErrorMessage(null);
+    setRemoteErrorMessage(null);
+    setServerStatus("checking");
+
+    const catalogPromise: Promise<{ catalog: VideoDefinition[] | null; error: string | null }> = fetch(CATALOG_URL, {
+      cache: "no-store",
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Catalog request failed: ${response.status}`);
+        return { catalog: (await response.json()) as VideoDefinition[], error: null };
+      })
+      .catch((error) => ({
+        catalog: null,
+        error: error instanceof Error ? error.message : "無法載入遠端影片資料",
+      }));
+
+    try {
+      const [storedRecords, storedProgress, catalogResult] = await Promise.all([
+        invoke<DownloadRecord[]>("list_downloads"),
+        invoke<WatchProgress[]>("list_watch_progress"),
+        catalogPromise,
+      ]);
+      const storedDownloads = Object.fromEntries(storedRecords.map((record) => [record.videoId, record]));
+      const storedWatchProgress = Object.fromEntries(storedProgress.map((record) => [record.videoId, record]));
+      setDownloads(storedDownloads);
+      setWatchProgress(storedWatchProgress);
+      setSelectedId((current) => current ?? Object.keys(storedDownloads)[0] ?? catalogResult.catalog?.[0]?.id ?? null);
+
+      if (catalogResult.catalog) {
+        setCatalog(catalogResult.catalog);
+        setServerStatus("online");
+      } else {
+        setCatalog([]);
+        setServerStatus("offline");
+        setRemoteErrorMessage(`遠端影片資料載入失敗：${catalogResult.error ?? "服務無法使用"}`);
+      }
+      setLocalDataLoading(false);
+    } catch (error) {
+      setLocalDataError(getInvokeError(error, "本機資料載入失敗，請重新載入"));
+      setLocalDataLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadLocalData();
+  }, [loadLocalData]);
 
   useEffect(() => {
     let disposed = false;
@@ -175,22 +281,94 @@ function App() {
     };
   }, [selectedDownload?.videoId, selectedVideo?.sourceUrl, serverStatus]);
 
-  async function refreshCatalog() {
+  const refreshCatalog = useCallback(async () => {
+    flushProgress();
     setServerStatus("checking");
     setErrorMessage(null);
+    setRemoteErrorMessage(null);
 
     try {
+      const healthResponse = await fetch(HEALTH_URL, { cache: "no-store" });
+      if (!healthResponse.ok) throw new Error(`Health request failed: ${healthResponse.status}`);
       const response = await fetch(CATALOG_URL, { cache: "no-store" });
       if (!response.ok) throw new Error(`Catalog request failed: ${response.status}`);
       const remoteCatalog = (await response.json()) as VideoDefinition[];
       setCatalog(remoteCatalog);
       setServerStatus("online");
       setSelectedId((current) => current ?? remoteCatalog[0]?.id ?? null);
-    } catch {
+    } catch (error) {
       setCatalog([]);
       setServerStatus("offline");
+      setRemoteErrorMessage(`遠端資料載入失敗：${error instanceof Error ? error.message : "服務無法使用"}`);
       setSelectedId((current) => (current && downloads[current] ? current : Object.keys(downloads)[0] ?? null));
     }
+  }, [downloads, flushProgress]);
+
+  useEffect(() => {
+    const handleOnline = () => {
+      void refreshCatalog();
+    };
+    const handleOffline = () => {
+      setCatalog([]);
+      setServerStatus("offline");
+      setRemoteErrorMessage("網路連線中斷，已切換至離線模式。");
+    };
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, [refreshCatalog]);
+
+  async function syncWatchProgress() {
+    const pending = Object.values(watchProgressRef.current).filter((record) => record.syncState === "pending");
+    if (pending.length === 0) return;
+
+    setSyncStatus("syncing");
+    setSyncErrorMessage(null);
+    const sent: WatchProgressSyncToken[] = pending.map(({ videoId, updatedAt }) => ({ videoId, updatedAt }));
+    try {
+      const response = await fetch(WATCH_PROGRESS_URL, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: 1, progress: pending }),
+      });
+      if (!response.ok) throw new Error(`Sync request failed: ${response.status}`);
+      const payload = (await response.json()) as { version: number; progress: WatchProgress[] };
+      if (payload.version !== 1 || !Array.isArray(payload.progress)) throw new Error("同步回應格式不正確");
+
+      const sentByVideoId = new Map(sent.map((item) => [item.videoId, item.updatedAt]));
+      const accepted = sent.filter((item) =>
+        payload.progress.some((record) => record.videoId === item.videoId && record.updatedAt === item.updatedAt),
+      );
+      const conflicts = payload.progress.filter((record) =>
+        sentByVideoId.has(record.videoId) && sentByVideoId.get(record.videoId) !== record.updatedAt,
+      );
+      if (accepted.length > 0) {
+        await invoke("mark_watch_progress_synced", { items: accepted });
+      }
+      if (conflicts.length > 0) {
+        await invoke("apply_remote_watch_progress", { request: { records: conflicts, sent } });
+      }
+      const latest = await invoke<WatchProgress[]>("list_watch_progress");
+      setWatchProgress(Object.fromEntries(latest.map((record) => [record.videoId, record])));
+      setSyncStatus("synced");
+    } catch (error) {
+      setSyncStatus("error");
+      setSyncErrorMessage("觀看進度尚未同步，將於稍後重試。");
+      if (syncRetryTimerRef.current) window.clearTimeout(syncRetryTimerRef.current);
+      syncRetryTimerRef.current = window.setTimeout(() => void syncWatchProgress(), 10_000);
+    }
+  }
+
+  useEffect(() => {
+    if (!localDataLoading && serverStatus === "online") void syncWatchProgress();
+  }, [localDataLoading, serverStatus]);
+
+  function selectVideo(videoId: string) {
+    prepareForSwitch();
+    setSelectedId(videoId);
   }
 
   async function downloadVideo(video: VideoDefinition) {
@@ -250,10 +428,41 @@ function App() {
         delete next[video.id];
         return next;
       });
+      setWatchProgress((current) => {
+        const next = { ...current };
+        delete next[video.id];
+        return next;
+      });
+      delete progressQueueRef.current[video.id];
       if (selectedId === video.id) setSelectedId(null);
     } catch (error) {
       setErrorMessage(getInvokeError(error, "刪除離線檔案失敗"));
     }
+  }
+
+  if (localDataLoading) {
+    return (
+      <main className="app-shell state-screen" aria-live="polite">
+        <div className="state-card">
+          <span className="eyebrow accent-text">LOCAL ARCHIVE / LOADING</span>
+          <h1>正在載入觀看進度</h1>
+          <p>進度載入完成前，播放器會暫時鎖定。</p>
+        </div>
+      </main>
+    );
+  }
+
+  if (localDataError) {
+    return (
+      <main className="app-shell state-screen" role="alert">
+        <div className="state-card is-error">
+          <span className="eyebrow">LOCAL ARCHIVE / ERROR</span>
+          <h1>無法載入本機資料</h1>
+          <p>{localDataError}</p>
+          <button className="download-button" onClick={() => void loadLocalData()}>重新載入</button>
+        </div>
+      </main>
+    );
   }
 
   const statusLabel = {
@@ -296,6 +505,20 @@ function App() {
       </section>
 
       {errorMessage && <div className="error-banner">{errorMessage}</div>}
+      {remoteErrorMessage && (
+        <div className="error-banner remote-error" role="alert">
+          <span>{remoteErrorMessage} 已切換至離線模式。</span>
+          <button className="refresh-button" onClick={() => void refreshCatalog()} disabled={serverStatus === "checking"}>
+            重新連線
+          </button>
+        </div>
+      )}
+      {syncStatus === "error" && syncErrorMessage && (
+        <div className="error-banner sync-error" role="status">
+          <span>{syncErrorMessage}</span>
+          <button className="refresh-button" onClick={() => void syncWatchProgress()}>立即重試</button>
+        </div>
+      )}
 
       <section className="content-grid">
         <aside className="library-panel" aria-label="影片清單">
@@ -310,6 +533,7 @@ function App() {
           <div className="video-list">
             {visibleVideos.map((video, index) => {
               const record = downloads[video.id];
+              const progress = watchProgress[video.id];
               const isSelected = selectedId === video.id;
               const isDownloading = activeDownloadId === video.id;
 
@@ -317,7 +541,7 @@ function App() {
                 <button
                   className={`video-row ${isSelected ? "is-selected" : ""}`}
                   key={video.id}
-                  onClick={() => setSelectedId(video.id)}
+                  onClick={() => selectVideo(video.id)}
                 >
                   <span className="row-number">{String(index + 1).padStart(2, "0")}</span>
                   <span className="video-row-copy">
@@ -327,7 +551,15 @@ function App() {
                     </small>
                   </span>
                   <span className={`row-state ${record ? "is-saved" : ""}`}>
-                    {isDownloading ? `${downloadProgress ?? 0}%` : record ? "離線" : "未下載"}
+                    {isDownloading
+                      ? `${downloadProgress ?? 0}%`
+                      : progress?.completed
+                        ? "看完"
+                        : progress
+                          ? `${formatPlaybackTime(progress.positionSeconds)} / ${formatPlaybackTime(progress.durationSeconds)}`
+                          : record
+                            ? "離線"
+                            : "未下載"}
                   </span>
                 </button>
               );
@@ -348,7 +580,8 @@ function App() {
               <div className="player-frame">
                 {playbackUrl ? (
                   <video
-                    key={playbackUrl}
+                    {...videoProps}
+                    key={`${selectedVideo.id}:${playbackUrl}`}
                     controls
                     src={playbackUrl}
                     preload="metadata"
@@ -360,6 +593,15 @@ function App() {
                   <div className="player-placeholder">
                     <span className="play-glyph">▶</span>
                     <p>下載後即可離線播放</p>
+                  </div>
+                )}
+                {resumePrompt?.videoId === selectedVideo.id && (
+                  <div className="resume-prompt" role="dialog" aria-label="繼續播放">
+                    <p>上次看到 {formatPlaybackTime(resumePrompt.positionSeconds)}</p>
+                    <div className="resume-actions">
+                      <button className="download-button" onClick={continuePlayback}>繼續播放</button>
+                      <button className="refresh-button" onClick={restartPlayback}>從頭播放</button>
+                    </div>
                   </div>
                 )}
                 {playbackErrorMessage && <div className="player-error" role="alert">{playbackErrorMessage}</div>}

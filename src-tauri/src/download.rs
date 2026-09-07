@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, AppHandle, Manager};
 
 use crate::crypto::EncryptedFileWriter;
+use crate::watch_progress;
 
 const DOWNLOAD_INDEX_FILE: &str = "downloads.json";
 
@@ -419,6 +420,8 @@ pub fn delete_download(app: AppHandle, video_id: String) -> Result<(), DownloadE
         }
 
         let path = encrypted_path(&app, &video_id)?;
+        watch_progress::delete_progress(&app, &video_id)
+            .map_err(|error| DownloadError::new(&error.code, error.message))?;
         fs::remove_file(path)
             .map_err(|error| DownloadError::new("FILE_DELETE_ERROR", error.to_string()))?;
         downloads.retain(|existing| existing.video_id != video_id);
